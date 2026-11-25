@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
 import type { Category, SessionCard, Snapshot } from '../types'
 
@@ -73,7 +73,7 @@ const fromBase64 = (s: string): Uint8Array => {
 }
 
 // Reads bytes [start, end) in pieces small enough for one $.fs.read each.
-const readBytes = async ($: any, path: string, start: number, end: number): Promise<Uint8Array> => {
+const readBytes = async ($: EngineInterface, path: string, start: number, end: number): Promise<Uint8Array> => {
   const out = new Uint8Array(end - start)
   let at = start
   while (at < end) {
@@ -193,16 +193,16 @@ const projectName = (folder: string, home: string): string => {
 
 // ------------------------------------------------------------ the refresh
 
-const refresh = async ($: any, projectsDir: string, home: string, thisSid: string) => {
+const refresh = async ($: EngineInterface, projectsDir: string, home: string, thisSid: string) => {
   const now = (await $.clock.now()) / 1000
   const horizon = now - SHOW_HOURS * 3600
   const cards: SessionCard[] = []
   const errors: string[] = []
   const folders = await $.fs.list(projectsDir)
   for (const folder of folders) {
-    if (folder.kind !== 'directory') continue
+    if (folder.kind !== 'dir') continue
     const dir = `${projectsDir}/${folder.name}`
-    let files: Array<{ name: string; kind: string; size: number; mtimeMs: number }> = []
+    let files: Awaited<ReturnType<EngineInterface['fs']['list']>> = []
     try { files = await $.fs.list(dir) } catch { continue }
     for (const f of files) {
       if (f.kind !== 'file' || !f.name.endsWith('.jsonl') || f.mtimeMs / 1000 < horizon) continue
