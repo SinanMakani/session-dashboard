@@ -16,7 +16,8 @@ const BUSY_STALE_S = 600 // mid-turn, no messages this long -> "check the sessio
 const ABANDON_S = 1800 // mid-turn, no messages this long -> idle (closed / interrupted)
 const APPROVAL_GUESS_S = 45 // a tool call with no result this long -> likely an approval prompt
 const RATE_WINDOW_S = 60
-const TAIL_BYTES = 4_000_000 // one $.fs.read may answer at most 4 MiB
+const TAIL_BYTES = 4_000_000 // how much of a long transcript to read the first time
+const CHUNK_BYTES = 1_000_000 // one $.fs.read answers at most 4 MiB (base64 adds a third)
 const DEFAULT_WINDOW = 200_000
 const LONG_TOOLS = new Set(['Agent', 'Task', 'Monitor', 'ScheduleWakeup', 'WebSearch', 'WebFetch'])
 
@@ -51,17 +52,42 @@ type Parsed = {
 
 const parsed = new Map<string, Parsed>() // by file path; starts over on a reload
 
-const utf8Len = (s: string): number => {
-  let n = 0
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i)
-    if (c < 0x80) n += 1
-    else if (c < 0x800) n += 2
-    else if (c >= 0xd800 && c <= 0xdbff) { n += 4; i++ }
-    else n += 3
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+const B64_INDEX = new Map([...B64].map((ch, i) => [ch, i]))
+
+const fromBase64 = (s: string): Uint8Array => {
+  const clean = s.replace(/[^A-Za-z0-9+/]/g, '')
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4))
+  let o = 0
+  for (let i = 0; i + 1 < clean.length; i += 4) {
+    const a = B64_INDEX.get(clean[i]!) ?? 0
+    const b = B64_INDEX.get(clean[i + 1]!) ?? 0
+    const c = B64_INDEX.get(clean[i + 2] ?? 'A') ?? 0
+    const d = B64_INDEX.get(clean[i + 3] ?? 'A') ?? 0
+    const n = (a << 18) | (b << 12) | (c << 6) | d
+    if (o < out.length) out[o++] = (n >> 16) & 255
+    if (o < out.length && i + 2 < clean.length) out[o++] = (n >> 8) & 255
+    if (o < out.length && i + 3 < clean.length) out[o++] = n & 255
   }
-  return n
+  return out.subarray(0, o)
 }
+
+// Reads bytes [start, end) in pieces small enough for one $.fs.read each.
+const readBytes = async ($: any, path: string, start: number, end: number): Promise<Uint8Array> => {
+  const out = new Uint8Array(end - start)
+  let at = start
+  while (at < end) {
+    const length = Math.min(CHUNK_BYTES, end - at)
+    const { base64 } = await $.fs.read(path, { as: 'bytes', offset: at, length })
+    const piece = fromBase64(base64)
+    if (piece.length === 0) break
+    out.set(piece.subarray(0, end - at), at - start)
+    at += piece.length
+  }
+  return out.subarray(0, at - start)
+}
+
+const decoder = new TextDecoder('utf-8')
 
 const ts = (s: unknown): number => {
   const t = typeof s === 'string' ? Date.parse(s) : NaN
@@ -171,6 +197,7 @@ const refresh = async ($: any, projectsDir: string, home: string, thisSid: strin
   const now = (await $.clock.now()) / 1000
   const horizon = now - SHOW_HOURS * 3600
   const cards: SessionCard[] = []
+  const errors: string[] = []
   const folders = await $.fs.list(projectsDir)
   for (const folder of folders) {
     if (folder.kind !== 'directory') continue
@@ -192,16 +219,21 @@ const refresh = async ($: any, projectsDir: string, home: string, thisSid: strin
       if (f.size < s.offset) s.offset = -1 // rewritten
       if (f.size !== s.offset) {
         const start = s.offset < 0 ? Math.max(0, f.size - TAIL_BYTES) : s.offset
-        const text: string = await $.fs.read(path, { offset: start, length: f.size - start })
-        const cut = text.lastIndexOf('\n')
-        if (cut >= 0) {
-          for (const line of text.slice(0, cut).split('\n')) {
-            if (!line.trim()) continue
-            try { ingest(s, JSON.parse(line)) } catch { /* partial first line after a tail seek */ }
-          }
-          // count from the end: the cut-off start of a tail read may hold a replaced character
-          s.offset = f.size - utf8Len(text.slice(cut + 1))
-        } else if (s.offset < 0) s.offset = start
+        try {
+          const bytes = await readBytes($, path, start, f.size)
+          const cut = bytes.lastIndexOf(10) // the last complete line ends here
+          if (cut >= 0) {
+            const text = decoder.decode(bytes.subarray(0, cut))
+            for (const line of text.split('\n')) {
+              if (!line.trim()) continue
+              try { ingest(s, JSON.parse(line)) } catch { /* partial first line after a tail seek */ }
+            }
+            s.offset = start + cut + 1
+          } else if (s.offset < 0) s.offset = start
+        } catch (err) {
+          errors.push(`${projectName(folder.name, home)}: ${String(err).slice(0, 120)}`)
+          continue // one unreadable transcript never stops the others
+        }
         s.outputs = s.outputs.filter(([at]) => at >= now - 600)
       }
       const last = s.lastActivity || f.mtimeMs / 1000
@@ -228,7 +260,7 @@ const refresh = async ($: any, projectsDir: string, home: string, thisSid: strin
     }
   }
   cards.sort((a, b) => a.agoSec - b.agoSec)
-  return cards
+  return { cards, errors }
 }
 
 // ------------------------------------------------------------ formatting
@@ -262,8 +294,12 @@ export const register: Register = on => {
 
     const tick = async () => {
       try {
-        const cards = projectsDir ? await refresh($, projectsDir, home, thisSid) : []
-        await update($, snapshot, () => ({ cards, error: projectsDir ? '' : 'This session keeps no transcript on this machine.' }))
+        if (!projectsDir) {
+          await update($, snapshot, () => ({ cards: [], error: 'This session keeps no transcript on this machine.' }))
+          return
+        }
+        const { cards, errors } = await refresh($, projectsDir, home, thisSid)
+        await update($, snapshot, () => ({ cards, error: errors.length ? `Couldn't read: ${errors.join('; ')}` : '' }))
       } catch (err) {
         await update($, snapshot, s => ({ ...s, error: String(err) }))
       }
