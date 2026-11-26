@@ -22,7 +22,7 @@ const DEFAULT_WINDOW = 200_000
 const LONG_TOOLS = new Set(['Agent', 'Task', 'Monitor', 'ScheduleWakeup', 'WebSearch', 'WebFetch'])
 
 const snapshot = atom({ plugin: 'session-dashboard', key: 'snapshot' } as const,
-  { cards: [], error: '' }, { shape: 'snapshot-1' })
+  { cards: [], error: '' }, { shape: 'snapshot-2' })
 const hidden = atom({ plugin: 'session-dashboard', key: 'hidden' } as const, [], { shape: 'hidden-1' })
 const picking = atom({ plugin: 'session-dashboard', key: 'picking' } as const, false, { shape: 'picking-1' })
 
@@ -256,6 +256,10 @@ const refresh = async ($: EngineInterface, projectsDir: string, home: string, th
         turnRate: s.turnStart && s.turnOut ? s.turnOut / Math.max(1, now - s.turnStart) : 0,
         agoSec: Math.max(0, now - last),
         isThis: s.sid === thisSid,
+        spark: Array.from({ length: 12 }, (_, i) => {
+          const from = now - (12 - i) * 50
+          return s!.outputs.filter(([at]) => at >= from && at < from + 50).reduce((n, [, o]) => n + o, 0)
+        }),
       })
     }
   }
@@ -265,15 +269,43 @@ const refresh = async ($: EngineInterface, projectsDir: string, home: string, th
 
 // ------------------------------------------------------------ formatting
 
-const k = (n: number) => n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e4 ? `${Math.round(n / 1e3)}k` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : `${Math.round(n)}`
-const ago = (sec: number) => sec < 60 ? `${Math.round(sec)}s ago` : sec < 3600 ? `${Math.floor(sec / 60)}m ago` : `${Math.floor(sec / 3600)}h${String(Math.floor((sec % 3600) / 60)).padStart(2, '0')}m ago`
-const clip = (t: string, n: number) => t.length <= n ? t : `${t.slice(0, n - 1)}…`
+const k = (n: number) => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${Math.round(n / 1e3)}k` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : `${Math.round(n)}`
+const ago = (sec: number) => sec < 60 ? 'just now' : sec < 3600 ? `${Math.floor(sec / 60)} min ago` : sec < 86400 ? `${Math.floor(sec / 3600)} h ago` : `${Math.floor(sec / 86400)} d ago`
+const rate = (r: number) => r >= 10 ? `${Math.round(r)}` : r > 0 ? r.toFixed(1) : '0'
+const sentence = (t: string) => t ? t[0]!.toUpperCase() + t.slice(1) : t
 
-const SECTIONS: Array<[Category, string, string]> = [
-  ['running', 'RUNNING / IN PROGRESS', 'success'],
-  ['waiting', 'WAITING FOR INPUT', 'warning'],
-  ['idle', 'IDLE', 'subtle'],
-]
+// Status is shape + word + colour, never colour alone (dataviz: status palette).
+const STATUS: Record<Category, { label: string; glyph: string; color: string }> = {
+  running: { label: 'Running', glyph: '●', color: 'success' },
+  waiting: { label: 'Waiting for you', glyph: '▲', color: 'warning' },
+  idle: { label: 'Idle', glyph: '○', color: 'subtle' },
+}
+const ORDER: Category[] = ['running', 'waiting', 'idle']
+
+// Context meter: the fill carries severity, accent -> warning -> error.
+const meterColor = (frac: number) => frac < 0.6 ? 'claude' : frac < 0.85 ? 'warning' : 'error'
+
+// A 12-point trend line in the accent, drawn as an image (theme keys can't reach it).
+const ACCENT = '#d97757'
+const sparkSvg = (points: number[], w = 96, h = 20): string => {
+  const peak = Math.max(...points, 1)
+  const pad = 3 // room for the round caps and the end dot
+  const step = (w - 2 * pad) / Math.max(1, points.length - 1)
+  const xy = points.map((v, i) => [pad + i * step, h - pad - (v / peak) * (h - 2 * pad)] as const)
+  const line = xy.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ')
+  const [lx, ly] = xy[xy.length - 1] ?? [w, h - 2]
+  const isFlat = points.every(v => v === 0)
+  const stroke = isFlat ? '#8a8a86' : ACCENT
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">`
+    + `<polyline points="${line}" fill="none" stroke="${stroke}" stroke-opacity="${isFlat ? 0.5 : 1}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`
+    + (isFlat ? '' : `<circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2.5" fill="${ACCENT}"/>`)
+    + '</svg>'
+}
+const sparkText = (points: number[]): string => {
+  const bars = '▁▂▃▄▅▆▇█'
+  const peak = Math.max(...points, 1)
+  return points.map(v => v === 0 ? '▁' : bars[Math.min(7, Math.round((v / peak) * 7))]).join('')
+}
 
 // ------------------------------------------------------------ hooks
 
@@ -299,7 +331,7 @@ export const register: Register = on => {
           return
         }
         const { cards, errors } = await refresh($, projectsDir, home, thisSid)
-        await update($, snapshot, () => ({ cards, error: errors.length ? `Couldn't read: ${errors.join('; ')}` : '' }))
+        await update($, snapshot, () => ({ cards, error: errors.length ? `Couldn't read ${errors.join('; ')}` : '' }))
       } catch (err) {
         await update($, snapshot, s => ({ ...s, error: String(err) }))
       }
@@ -317,7 +349,9 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button, Progress } = $.ui.resolve(e)
+    const table = $.ui.resolve(e)
+    const { Box, Text, Button, Progress } = table
+    const Svg = 'Svg' in table ? table.Svg : undefined
     const snap = await read($, snapshot)
     const hide = new Set(await read($, hidden))
     const isPicking = await read($, picking)
@@ -327,59 +361,93 @@ export const register: Register = on => {
       await $.store.set('hidden', list)
     }
 
+    // ---------------------------------------------------- the picker
     if (isPicking) {
       return (
         <Box flexDirection="column" gap={1}>
-          <Text weight="semibold">Choose which sessions to show</Text>
-          {snap.cards.map(c => (
-            <Box flexDirection="row" gap={1} alignItems="center">
-              <Button key={`pick-${c.sid}`} label={hide.has(c.sid) ? 'Hidden' : 'Shown'}
-                variant={hide.has(c.sid) ? 'secondary' : 'primary'}
-                onPress={() => setHidden(c.sid, !hide.has(c.sid))} />
-              <Text wrap="truncate-end" dimColor={hide.has(c.sid)}>
-                {c.name}{c.isThis ? ' (this session)' : ''} — {c.title || c.prompt}
-              </Text>
-            </Box>
-          ))}
+          <Box flexDirection="column">
+            <Text weight="semibold">Choose sessions</Text>
+            <Text dimColor size="footnote">Hidden sessions stay hidden in every session until you show them.</Text>
+          </Box>
+          <Box flexDirection="column" gap={1}>
+            {snap.cards.map(c => {
+              const isHidden = hide.has(c.sid)
+              const st = STATUS[c.category]
+              return (
+                <Box flexDirection="row" gap={1} alignItems="center" justifyContent="space-between">
+                  <Box flexDirection="column" flexShrink={1}>
+                    <Text wrap="truncate-end" dimColor={isHidden}>
+                      <Text color={st.color}>{st.glyph}</Text> <Text weight="semibold">{c.name}</Text>
+                      {c.isThis && <Text dimColor> · this session</Text>}
+                    </Text>
+                    <Text dimColor wrap="truncate-end" size="footnote">{c.title || c.prompt}</Text>
+                  </Box>
+                  <Button key={`pick-${c.sid}`} label={isHidden ? 'Show' : 'Hide'}
+                    variant="secondary" onPress={() => setHidden(c.sid, !isHidden)} />
+                </Box>
+              )
+            })}
+          </Box>
           <Box flexDirection="row" gap={1}>
             <Button key="done" label="Done" variant="primary" onPress={() => update($, picking, () => false)} />
-            <Button key="show-all" label="Show all" onPress={async () => {
-              await update($, hidden, () => [])
-              await $.store.set('hidden', [])
-            }} />
+            {hide.size > 0 && (
+              <Button key="show-all" label="Show all sessions" variant="secondary" onPress={async () => {
+                await update($, hidden, () => [])
+                await $.store.set('hidden', [])
+              }} />
+            )}
           </Box>
         </Box>
       )
     }
 
+    // ---------------------------------------------------- the dashboard
     const shown = snap.cards.filter(c => !hide.has(c.sid))
-    const groups = { running: [] as SessionCard[], waiting: [] as SessionCard[], idle: [] as SessionCard[] }
+    const groups: Record<Category, SessionCard[]> = { running: [], waiting: [], idle: [] }
     for (const c of shown) groups[c.category].push(c)
     const total = shown.reduce((n, c) => n + c.rate, 0)
+    const hiddenCount = snap.cards.length - shown.length
 
-    const card = (c: SessionCard, color: string) => {
+    const tile = (label: string, value: string, cat?: Category) => (
+      <Box flexDirection="column" flexGrow={1}>
+        <Text dimColor size="footnote" wrap="truncate-end">
+          {cat && <Text color={STATUS[cat].color}>{STATUS[cat].glyph} </Text>}{label}
+        </Text>
+        <Text size="heading" weight="semibold">{value}</Text>
+      </Box>
+    )
+
+    const card = (c: SessionCard) => {
+      const st = STATUS[c.category]
       const frac = c.window ? Math.min(1, c.context / c.window) : 0
+      const sub = c.title && c.prompt && c.prompt !== c.title ? c.prompt : ''
       return (
-        <Box flexDirection="column" borderStyle="round" borderColor={color} paddingX={1}>
-          <Box flexDirection="row" justifyContent="space-between">
+        <Box flexDirection="column" borderStyle="round" borderColor="promptBorder" paddingX={1} gap={0}>
+          <Box flexDirection="row" justifyContent="space-between" gap={1}>
             <Text wrap="truncate-end">
-              <Text bold>{c.name}</Text>
-              <Text dimColor>  {c.model}{c.isThis ? ' · this session' : ''}</Text>
+              <Text color={st.color}>{st.glyph}</Text> <Text weight="semibold">{c.name}</Text>
+              {c.isThis && <Text dimColor> · this session</Text>}
             </Text>
-            <Text color={color} bold size="caption">
-              {c.category === 'running' ? c.detail.toUpperCase() : `WAITING · ${ago(c.agoSec)}`}
-            </Text>
+            <Text dimColor size="footnote">{c.model}</Text>
           </Box>
-          {(c.title || c.prompt) && <Text dimColor wrap="truncate-end">{c.title || c.prompt}</Text>}
+          {(c.title || c.prompt) && <Text wrap="truncate-end">{c.title || c.prompt}</Text>}
+          {sub && <Text dimColor size="footnote" wrap="truncate-end">“{sub}”</Text>}
           {c.category === 'waiting'
-            ? <Text color="warning" bold wrap="truncate-end">⏵ {c.detail}</Text>
-            : c.title && c.prompt && c.prompt !== c.title && <Text dimColor italic wrap="truncate-end">› {c.prompt}</Text>}
-          <Progress label="Context" value={frac} max={1}
-            valueText={`${k(c.context)} / ${k(c.window)} (${Math.round(frac * 100)}%)`}
-            color={frac < 0.6 ? 'success' : frac < 0.85 ? 'warning' : 'error'} />
-          <Text dimColor mono tabular>
-            {c.rate.toFixed(1)} tok/s · this turn {k(c.turnOut)} at {c.turnRate.toFixed(1)}/s
-          </Text>
+            ? <Text wrap="truncate-end"><Text color="warning">▲</Text> {sentence(c.detail)}</Text>
+            : <Text dimColor size="footnote" wrap="truncate-end">{sentence(c.detail)}</Text>}
+          <Box marginTop={1}>
+            <Progress label="Context" value={frac} max={1}
+              valueText={`${k(c.context)} of ${k(c.window)}`} color={meterColor(frac)} />
+          </Box>
+          <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
+            <Text>
+              <Text weight="semibold">{rate(c.rate)}</Text>
+              <Text dimColor size="footnote"> tok/s · {k(c.turnOut)} this turn</Text>
+            </Text>
+            {Svg
+              ? <Svg source={sparkSvg(c.spark)} alt={`Output over the last 10 minutes, now ${rate(c.rate)} tokens a second`} width={96} height={20} />
+              : <Text color="claude">{sparkText(c.spark)}</Text>}
+          </Box>
         </Box>
       )
     }
@@ -387,12 +455,18 @@ export const register: Register = on => {
     const row = (c: SessionCard) => {
       const pct = c.window ? Math.round(Math.min(1, c.context / c.window) * 100) : 0
       return (
-        <Box flexDirection="row" justifyContent="space-between" gap={1}>
-          <Text wrap="truncate-end">
-            <Text bold>{c.name}</Text>
-            <Text dimColor>  {clip(c.title || c.prompt, 40)}{c.isThis ? ' · this session' : ''}</Text>
-          </Text>
-          <Text dimColor mono tabular>ctx {pct}% · {ago(c.agoSec)}</Text>
+        <Box flexDirection="row" justifyContent="space-between" gap={2}>
+          <Box flexDirection="column" flexShrink={1}>
+            <Text wrap="truncate-end">
+              <Text color={STATUS.idle.color}>{STATUS.idle.glyph}</Text> <Text weight="medium">{c.name}</Text>
+              {c.isThis && <Text dimColor> · this session</Text>}
+            </Text>
+            {(c.title || c.prompt) && <Text dimColor size="footnote" wrap="truncate-end">{c.title || c.prompt}</Text>}
+          </Box>
+          <Box flexDirection="column" alignItems="flex-end" flexShrink={0}>
+            <Text dimColor size="footnote" tabular>{ago(c.agoSec)}</Text>
+            <Text dimColor size="footnote" tabular>{pct}% context</Text>
+          </Box>
         </Box>
       )
     }
@@ -400,22 +474,33 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="row" gap={2}>
-          <Text color="success" bold>{groups.running.length} running</Text>
-          <Text color="warning" bold>{groups.waiting.length} waiting</Text>
-          <Text dimColor bold>{groups.idle.length} idle</Text>
-          <Text bold>{Math.round(total)} tok/s</Text>
+          {tile('Running', String(groups.running.length), 'running')}
+          {tile('Waiting', String(groups.waiting.length), 'waiting')}
+          {tile('Idle', String(groups.idle.length), 'idle')}
+          {tile('Output', `${Math.round(total)} tok/s`)}
         </Box>
-        {snap.error && <Text color="error">{snap.error}</Text>}
-        {SECTIONS.map(([key, label, color]) => (
-          <Box flexDirection="column">
-            <Text color={color} bold size="caption">{label} ({groups[key].length})</Text>
-            {groups[key].length === 0 && <Text dimColor>— none</Text>}
-            {groups[key].map(c => key === 'idle' ? row(c) : card(c, color))}
+
+        {snap.error && <Text color="error" wrap="wrap">{snap.error}</Text>}
+        {shown.length === 0 && !snap.error && (
+          <Text dimColor>No Claude sessions in the last {SHOW_HOURS} hours.</Text>
+        )}
+
+        {ORDER.filter(cat => groups[cat].length > 0).map(cat => (
+          <Box flexDirection="column" gap={cat === 'idle' ? 1 : 0}>
+            <Text weight="semibold" size="footnote">
+              {STATUS[cat].label} <Text dimColor>{groups[cat].length}</Text>
+            </Text>
+            {cat === 'idle'
+              ? groups.idle.map(row)
+              : <Box flexDirection="column" gap={1}>{groups[cat].map(card)}</Box>}
           </Box>
         ))}
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
-          <Text dimColor size="caption">{snap.cards.length - shown.length} hidden · last {SHOW_HOURS}h</Text>
-          <Button key="choose" label="Choose sessions" onPress={() => update($, picking, () => true)} />
+
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
+          <Text dimColor size="footnote">
+            {hiddenCount > 0 ? `${hiddenCount} hidden · ` : ''}Last {SHOW_HOURS} hours
+          </Text>
+          <Button key="choose" label="Choose sessions" variant="secondary" onPress={() => update($, picking, () => true)} />
         </Box>
       </Box>
     )

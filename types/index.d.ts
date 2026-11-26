@@ -15,6 +15,8 @@ export type SessionCard = {
   turnRate: number
   agoSec: number
   isThis: boolean
+  /** output tokens per 50 s, oldest first, last 10 minutes */
+  spark: number[]
 }
 
 export type Snapshot = { cards: SessionCard[]; error: string }
